@@ -43,7 +43,7 @@ jobs:
             print('🚀 Iniciando browser Chromium...')
             browser = p.chromium.launch(
               headless=True,
-              args=['--no-sandbox', '--disable-dev-shm-usage']
+              args=['--no-sandbox','--disable-dev-shm-usage','--disable-blink-features=AutomationControlled']
             )
             context = browser.new_context(
               locale='es-PE',
@@ -55,17 +55,35 @@ jobs:
 
             try:
               print(f'📡 Navegando a {URL}')
-              page.goto(URL, wait_until='networkidle', timeout=60000)
+              # Esperar a que la red esté inactiva (Angular terminó de cargar)
+              page.goto(URL, wait_until='networkidle', timeout=90000)
+              print('✅ Página cargada (networkidle)')
 
-              print('⏳ Esperando que carguen los datos...')
-              page.wait_for_selector('text=%', timeout=30000)
+              # Esperar 5 segundos adicionales para que Angular renderice
+              page.wait_for_timeout(5000)
 
-              page.screenshot(path='onpe_screenshot.png')
+              # Screenshot para diagnóstico
+              page.screenshot(path='onpe_screenshot.png', full_page=True)
+              print('📸 Screenshot guardado')
+
+              # Extraer texto completo del body
               full_text = page.inner_text('body')
-              print(f'\n📄 Texto extraído (primeros 800 chars):\n{full_text[:800]}')
+              print(f'\n📄 Texto extraído ({len(full_text)} chars)')
+              print(f'--- PRIMEROS 1000 CHARS ---')
+              print(full_text[:1000])
+              print(f'--- FIN PREVIEW ---\n')
 
-              # ── Fecha y hora de actualización de ONPE ──
-              # Patrón: "ACTUALIZADO AL 09/06/2026 A LAS 09:28:00 p. m."
+              # Si el texto es muy corto, probablemente no cargó
+              if len(full_text) < 100:
+                print('⚠ Texto muy corto — guardando HTML para debug')
+                html = page.content()
+                with open('onpe_debug.html', 'w', encoding='utf-8') as f:
+                  f.write(html)
+                print(f'HTML guardado ({len(html)} chars)')
+                browser.close()
+                sys.exit(0)
+
+              # ── Timestamp ONPE ──
               onpe_ts = None
               ts_m = re.search(
                 r'ACTUALIZADO AL\s+(\d{2}/\d{2}/\d{4})\s+A LAS\s+(\d{1,2}:\d{2}:\d{2}\s*[ap]\.\s*m\.)',
@@ -75,41 +93,59 @@ jobs:
                 onpe_ts = f"{ts_m.group(1)} {ts_m.group(2).strip()}"
                 print(f'🕐 Timestamp ONPE: {onpe_ts}')
               else:
-                print('⚠ No se encontró timestamp de ONPE')
+                print('⚠ Timestamp ONPE no encontrado')
 
-              # ── % actas contabilizadas ──
-              actas_m = re.search(r'(\d{1,3}[.,]\d{3})\s*%\s*Actas contabilizadas', full_text, re.IGNORECASE)
-              if not actas_m:
-                actas_m = re.search(r'Actas contabilizadas[^\d]*(\d{1,3}[.,]\d{3})', full_text, re.IGNORECASE)
-              actas_pct = float(actas_m.group(1).replace(',', '.')) if actas_m else None
+              # ── % actas ──
+              actas_pct = None
+              for pat in [
+                r'(\d{1,3}[.,]\d{3})\s*%\s*Actas contabilizadas',
+                r'Actas contabilizadas[^\d]*(\d{1,3}[.,]\d{3})',
+                r'(\d{2,3}[.,]\d{3})\s*%',
+              ]:
+                m = re.search(pat, full_text, re.IGNORECASE)
+                if m:
+                  actas_pct = float(m.group(1).replace(',', '.'))
+                  break
 
               # ── Total actas ──
               total_m = re.search(r'Total de actas[:\s]*([0-9][0-9,.]+)', full_text, re.IGNORECASE)
               actas_total = int(total_m.group(1).replace(',','').replace('.','')) if total_m else None
 
               # ── Porcentajes candidatos ──
-              s_pct_m = re.search(r'(?:SANCHEZ|SÁNCHEZ)[^%\d]*(\d{2}[.,]\d{3})\s*%', full_text, re.IGNORECASE)
-              if not s_pct_m:
-                s_pct_m = re.search(r'(\d{2}[.,]\d{3})\s*%[^%]*(?:SANCHEZ|SÁNCHEZ)', full_text, re.IGNORECASE)
-              k_pct_m = re.search(r'(?:FUJIMORI|KEIKO)[^%\d]*(\d{2}[.,]\d{3})\s*%', full_text, re.IGNORECASE)
-              if not k_pct_m:
-                k_pct_m = re.search(r'(\d{2}[.,]\d{3})\s*%[^%]*(?:FUJIMORI|KEIKO)', full_text, re.IGNORECASE)
+              # Buscar los dos porcentajes XX.XXX% más prominentes en el texto
+              todos_pct = re.findall(r'(\d{2}[.,]\d{3})\s*%', full_text)
+              pcts_validos = []
+              for p in todos_pct:
+                v = float(p.replace(',','.'))
+                if 40 < v < 60:  # porcentajes electorales razonables
+                  pcts_validos.append(v)
 
-              sanchez_pct = float(s_pct_m.group(1).replace(',','.')) if s_pct_m else None
-              keiko_pct   = float(k_pct_m.group(1).replace(',','.')) if k_pct_m else None
+              print(f'Porcentajes encontrados (40-60%): {pcts_validos}')
+
+              # Intentar identificar por nombre
+              s_pct_m = re.search(r'(?:SANCHEZ|SÁNCHEZ|Sanchez|Sánchez)[^%\d]{0,50}(\d{2}[.,]\d{3})\s*%', full_text, re.IGNORECASE)
+              k_pct_m = re.search(r'(?:FUJIMORI|KEIKO|Fujimori|Keiko)[^%\d]{0,50}(\d{2}[.,]\d{3})\s*%', full_text, re.IGNORECASE)
+
+              sanchez_pct = float(s_pct_m.group(1).replace(',','.')) if s_pct_m else (pcts_validos[0] if len(pcts_validos)>=1 else None)
+              keiko_pct   = float(k_pct_m.group(1).replace(',','.')) if k_pct_m else (pcts_validos[1] if len(pcts_validos)>=2 else None)
 
               # ── Votos absolutos ──
-              s_v_m = re.search(r"(?:SANCHEZ|SÁNCHEZ)[^\d]*(\d[\d',.]{6,11})\s*votos", full_text, re.IGNORECASE)
-              k_v_m = re.search(r"(?:FUJIMORI|KEIKO)[^\d]*(\d[\d',.]{6,11})\s*votos", full_text, re.IGNORECASE)
+              todos_votos = re.findall(r"(\d[\d',.]{6,11})\s*votos", full_text, re.IGNORECASE)
+              validos_v = []
+              for v in todos_votos:
+                try:
+                  n = limpiar_votos(v)
+                  if 5_000_000 < n < 15_000_000:
+                    validos_v.append(n)
+                except: pass
 
-              if not s_v_m or not k_v_m:
-                todos = re.findall(r"(\d[\d',.]{6,11})\s*votos", full_text)
-                validos = [limpiar_votos(v) for v in todos if 5_000_000 < limpiar_votos(v) < 15_000_000]
-                sanchez_votos = validos[0] if len(validos) > 0 else None
-                keiko_votos   = validos[1] if len(validos) > 1 else None
-              else:
-                sanchez_votos = limpiar_votos(s_v_m.group(1))
-                keiko_votos   = limpiar_votos(k_v_m.group(1))
+              print(f'Votos válidos encontrados: {validos_v}')
+
+              s_v_m = re.search(r"(?:SANCHEZ|SÁNCHEZ|Sanchez)[^\d]{0,30}(\d[\d',.]{6,11})\s*votos", full_text, re.IGNORECASE)
+              k_v_m = re.search(r"(?:FUJIMORI|KEIKO|Fujimori)[^\d]{0,30}(\d[\d',.]{6,11})\s*votos", full_text, re.IGNORECASE)
+
+              sanchez_votos = limpiar_votos(s_v_m.group(1)) if s_v_m else (validos_v[0] if len(validos_v)>=1 else None)
+              keiko_votos   = limpiar_votos(k_v_m.group(1)) if k_v_m else (validos_v[1] if len(validos_v)>=2 else None)
 
               print(f'\n📊 Datos extraídos:')
               print(f'   Timestamp ONPE : {onpe_ts}')
@@ -118,16 +154,17 @@ jobs:
               print(f'   Keiko          : {keiko_pct}% | {keiko_votos} votos')
 
               if not sanchez_pct and not keiko_pct:
-                print('\n⚠ Sin datos en el DOM. Texto completo:')
-                print(full_text[:3000])
+                print('\n⚠ No se encontraron datos. Guardando HTML completo para debug...')
+                with open('onpe_debug.html','w',encoding='utf-8') as f:
+                  f.write(page.content())
+                print('onpe_debug.html guardado — revisa ese archivo en el repo')
                 browser.close()
                 sys.exit(0)
 
               diff  = abs(sanchez_votos - keiko_votos) if sanchez_votos and keiko_votos else None
-              lider = 'sanchez' if (sanchez_votos or 0) >= (keiko_votos or 0) else 'keiko'
+              lider = 'sanchez' if (sanchez_votos or sanchez_pct or 0) >= (keiko_votos or keiko_pct or 0) else 'keiko'
               ts    = now_utc()
 
-              # ── JSON ──
               resultado = {
                 'sanchez':    {'nombre':'Roberto Helbert Sanchez Palomino','partido':'Juntos por el Perú','pct':sanchez_pct,'votos':sanchez_votos},
                 'keiko':      {'nombre':'Keiko Sofia Fujimori Higuchi',    'partido':'Fuerza Popular',    'pct':keiko_pct,  'votos':keiko_votos},
@@ -139,10 +176,10 @@ jobs:
                 'fuente':     'ONPE web (Playwright RPA)',
                 'actualizadoEn': ts,
               }
+
               with open('resultados.json','w',encoding='utf-8') as f:
                 json.dump(resultado, f, ensure_ascii=False, indent=2)
 
-              # ── CSV historial ──
               csv_path = 'historial.csv'
               nuevo = not os.path.exists(csv_path)
               with open(csv_path,'a',newline='',encoding='utf-8') as f:
@@ -160,7 +197,11 @@ jobs:
               import traceback
               print(f'\n❌ ERROR: {e}')
               traceback.print_exc()
-              try: page.screenshot(path='onpe_error.png')
+              try:
+                page.screenshot(path='onpe_error.png', full_page=True)
+                with open('onpe_debug.html','w',encoding='utf-8') as f:
+                  f.write(page.content())
+                print('onpe_error.png y onpe_debug.html guardados para debug')
               except: pass
             finally:
               browser.close()
@@ -170,6 +211,6 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add resultados.json historial.csv onpe_screenshot.png || true
+          git add resultados.json historial.csv onpe_screenshot.png onpe_error.png onpe_debug.html 2>/dev/null || true
           git diff --cached --quiet || git commit -m "data: RPA ONPE $(date -u '+%H:%M UTC')"
           git push
