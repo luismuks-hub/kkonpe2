@@ -1,0 +1,228 @@
+name: Fetch RPA ONPE
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Playwright
+        run: |
+          pip install playwright
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Extraer datos ONPE con browser real
+        run: |
+          python3 << 'PYEOF'
+          from playwright.sync_api import sync_playwright
+          import json, csv, sys
+          from datetime import datetime, timezone
+
+          URL = 'https://resultadosegundavuelta.onpe.gob.pe/main/resumen'
+
+          def now_utc():
+            return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+          with sync_playwright() as p:
+            print('🚀 Iniciando browser Chromium...')
+            browser = p.chromium.launch(
+              headless=True,
+              args=['--no-sandbox', '--disable-dev-shm-usage']
+            )
+            context = browser.new_context(
+              locale='es-PE',
+              timezone_id='America/Lima',
+              user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+              viewport={'width': 1280, 'height': 800},
+            )
+            page = context.new_page()
+
+            try:
+              print(f'📡 Navegando a {URL}')
+              page.goto(URL, wait_until='networkidle', timeout=60000)
+
+              # Esperar que Angular renderice los datos
+              # El porcentaje de actas es el primer dato visible
+              print('⏳ Esperando que carguen los datos...')
+              page.wait_for_selector('text=%', timeout=30000)
+
+              # Captura de pantalla para debug (opcional)
+              page.screenshot(path='onpe_screenshot.png')
+              print('📸 Screenshot guardado')
+
+              # ── Extraer % actas contabilizadas ──
+              # Buscar el número grande de porcentaje de actas
+              actas_pct = None
+              actas_total = None
+
+              # Intentar varios selectores posibles del DOM de Angular
+              selectors_actas = [
+                '[class*="actas"] [class*="porcentaje"]',
+                '[class*="porcentaje-actas"]',
+                'text=/\\d{2,3}\\.\\d{3}\\s*%/',
+              ]
+
+              # Estrategia más robusta: leer todo el texto de la página
+              # y parsear con regex
+              import re
+              full_text = page.inner_text('body')
+              print(f'\n📄 Primeros 500 chars del body:\n{full_text[:500]}')
+
+              # ── Regex sobre el texto renderizado ──
+              # Actas: "96.392 %" o "96.392%"
+              actas_m = re.search(r'(\d{1,3}[.,]\d{3})\s*%\s*(?:Actas contabilizadas|actas contabilizadas)', full_text)
+              if not actas_m:
+                actas_m = re.search(r'Actas contabilizadas[^\d]*(\d{1,3}[.,]\d{3})\s*%', full_text)
+              actas_pct = float(actas_m.group(1).replace(',', '.')) if actas_m else None
+
+              # Total actas: "92,766" o "92.766"
+              total_m = re.search(r'Total de actas[:\s]*([0-9][0-9,.]+)', full_text, re.IGNORECASE)
+              actas_total = int(total_m.group(1).replace(',','').replace('.','')) if total_m else None
+
+              # ── Porcentajes candidatos ──
+              # Buscar patrones como "50.117 %" cerca de los nombres
+              sanchez_pct_m = re.search(
+                r'(?:SANCHEZ|SÁNCHEZ|Sánchez|Sanchez)[^%\d]*(\d{2}[.,]\d{3})\s*%',
+                full_text, re.IGNORECASE
+              )
+              if not sanchez_pct_m:
+                sanchez_pct_m = re.search(r'(\d{2}[.,]\d{3})\s*%[^%]*(?:SANCHEZ|SÁNCHEZ)', full_text, re.IGNORECASE)
+
+              keiko_pct_m = re.search(
+                r'(?:FUJIMORI|KEIKO|Fujimori|Keiko)[^%\d]*(\d{2}[.,]\d{3})\s*%',
+                full_text, re.IGNORECASE
+              )
+              if not keiko_pct_m:
+                keiko_pct_m = re.search(r'(\d{2}[.,]\d{3})\s*%[^%]*(?:FUJIMORI|KEIKO)', full_text, re.IGNORECASE)
+
+              sanchez_pct = float(sanchez_pct_m.group(1).replace(',','.')) if sanchez_pct_m else None
+              keiko_pct   = float(keiko_pct_m.group(1).replace(',','.'))   if keiko_pct_m   else None
+
+              # ── Votos absolutos ──
+              # Buscar números grandes (7+ dígitos) cerca de los nombres
+              # Patrón típico: "8'949,171 votos" o "8.949.171"
+              def limpiar_votos(s):
+                return int(re.sub(r"[',.\s]", '', s))
+
+              sanchez_votos_m = re.search(
+                r"(?:SANCHEZ|SÁNCHEZ|Sánchez)[^\d]*(\d[\d',.]{6,11})\s*votos",
+                full_text, re.IGNORECASE
+              )
+              keiko_votos_m = re.search(
+                r"(?:FUJIMORI|KEIKO|Fujimori)[^\d]*(\d[\d',.]{6,11})\s*votos",
+                full_text, re.IGNORECASE
+              )
+
+              # Fallback: buscar todos los números de 7+ dígitos
+              if not sanchez_votos_m or not keiko_votos_m:
+                todos_votos = re.findall(r"(\d[\d',.]{6,11})\s*votos", full_text)
+                votos_limpios = [limpiar_votos(v) for v in todos_votos if 5_000_000 < limpiar_votos(v) < 15_000_000]
+                if len(votos_limpios) >= 2:
+                  sanchez_votos = votos_limpios[0]
+                  keiko_votos   = votos_limpios[1]
+                else:
+                  sanchez_votos = keiko_votos = None
+              else:
+                sanchez_votos = limpiar_votos(sanchez_votos_m.group(1))
+                keiko_votos   = limpiar_votos(keiko_votos_m.group(1))
+
+              print(f'\n📊 Datos extraídos:')
+              print(f'   Actas: {actas_pct}% de {actas_total}')
+              print(f'   Sánchez: {sanchez_pct}% | {sanchez_votos} votos')
+              print(f'   Keiko:   {keiko_pct}% | {keiko_votos} votos')
+
+              # ── Si no tenemos datos, error informativo ──
+              if not sanchez_pct and not keiko_pct:
+                print('\n⚠ No se encontraron datos en el DOM.')
+                print('Texto completo de la página:')
+                print(full_text[:2000])
+                browser.close()
+                sys.exit(0)
+
+              # ── Calcular diferencia ──
+              diff = abs(sanchez_votos - keiko_votos) if sanchez_votos and keiko_votos else None
+              lider = 'sanchez' if (sanchez_votos or 0) >= (keiko_votos or 0) else 'keiko'
+
+              ts = now_utc()
+
+              # ── Guardar JSON ──
+              resultado = {
+                'sanchez': {
+                  'nombre':  'Roberto Helbert Sanchez Palomino',
+                  'partido': 'Juntos por el Perú',
+                  'pct':     sanchez_pct,
+                  'votos':   sanchez_votos,
+                },
+                'keiko': {
+                  'nombre':  'Keiko Sofia Fujimori Higuchi',
+                  'partido': 'Fuerza Popular',
+                  'pct':     keiko_pct,
+                  'votos':   keiko_votos,
+                },
+                'actasPct':   actas_pct,
+                'totalActas': actas_total,
+                'diff':       diff,
+                'lider':      lider,
+                'fuente':     'ONPE web (Playwright RPA)',
+                'actualizadoEn': ts,
+              }
+
+              with open('resultados.json', 'w', encoding='utf-8') as f:
+                json.dump(resultado, f, ensure_ascii=False, indent=2)
+
+              # ── Guardar CSV (historial acumulativo) ──
+              import os
+              csv_path = 'historial.csv'
+              escribir_header = not os.path.exists(csv_path)
+              with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                if escribir_header:
+                  writer.writerow([
+                    'timestamp', 'actasPct', 'totalActas',
+                    'sanchez_pct', 'sanchez_votos',
+                    'keiko_pct',   'keiko_votos',
+                    'diferencia',  'lider'
+                  ])
+                writer.writerow([
+                  ts, actas_pct, actas_total,
+                  sanchez_pct, sanchez_votos,
+                  keiko_pct,   keiko_votos,
+                  diff, lider
+                ])
+
+              print(f'\n✅ resultados.json y historial.csv actualizados')
+              print(json.dumps(resultado, ensure_ascii=False, indent=2))
+
+            except Exception as e:
+              import traceback
+              print(f'\n❌ ERROR: {e}')
+              traceback.print_exc()
+              # Screenshot del estado de error
+              try:
+                page.screenshot(path='onpe_error.png')
+              except:
+                pass
+            finally:
+              browser.close()
+          PYEOF
+
+      - name: Commit resultados
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add resultados.json historial.csv onpe_screenshot.png || true
+          git diff --cached --quiet || git commit -m "data: ONPE RPA $(date -u '+%H:%M UTC')"
+          git push
