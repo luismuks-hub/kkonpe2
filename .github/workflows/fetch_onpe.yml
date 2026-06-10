@@ -39,69 +39,73 @@ jobs:
             timeout=15
           )
 
-          def get(path):
-            r = requests.get(f'{BASE}{path}', **OPTS)
-            r.raise_for_status()
-            return r.json()
+          def get_raw(path):
+            url = f'{BASE}{path}'
+            print(f'\n>>> GET {url}')
+            r = requests.get(url, **OPTS)
+            print(f'    Status: {r.status_code}')
+            print(f'    Body (primeros 500 chars): {r.text[:500]}')
+            return r
 
           try:
-            # 1. idEleccion
-            proc = get('/proceso/proceso-electoral-activo')
-            raw  = proc.get('data') or proc
-            id_e = raw.get('idEleccion') or raw.get('id') or 1
-            print(f'idEleccion: {id_e}')
+            # DIAGNÓSTICO: ver qué devuelve cada endpoint
+            r1 = get_raw('/proceso/proceso-electoral-activo')
 
-            # 2. Candidatos y totales
-            cands_r = get(f'/candidatos/candidatos-segunda-vuelta?idEleccion={id_e}&tipoFiltro=eleccion')
-            tots_r  = get(f'/totales/totales-segunda-vuelta?idEleccion={id_e}&tipoFiltro=eleccion')
+            # Intentar con idEleccion=1 directo (sin llamar al proceso)
+            r2 = get_raw('/candidatos/candidatos-segunda-vuelta?idEleccion=1&tipoFiltro=eleccion')
+            r3 = get_raw('/totales/totales-segunda-vuelta?idEleccion=1&tipoFiltro=eleccion')
 
-            cands = cands_r if isinstance(cands_r, list) else (cands_r.get('data') or [])
-            tots  = tots_r  if isinstance(tots_r,  dict) else (tots_r.get('data')  or {})
+            # Si r2 tiene datos, procesar directo
+            if r2.status_code == 200 and r2.text.strip() and not r2.text.strip().startswith('<'):
+              cands_data = r2.json()
+              tots_data  = r3.json() if r3.status_code == 200 else {}
 
-            # 3. Identificar candidatos por nombre
-            keiko = sanchez = None
-            for c in cands:
-              n = (c.get('nombreCandidato') or '').upper()
-              if 'FUJIMORI' in n or 'KEIKO' in n:    keiko   = c
-              if 'SANCHEZ'  in n or 'SÁNCHEZ' in n:  sanchez = c
+              cands = cands_data if isinstance(cands_data, list) else (cands_data.get('data') or [])
+              tots  = tots_data  if isinstance(tots_data,  dict) else (tots_data.get('data')  or {})
 
-            if not keiko or not sanchez:
-              if len(cands) >= 2:
-                [sanchez, keiko] = cands[:2]
+              keiko = sanchez = None
+              for c in cands:
+                n = (c.get('nombreCandidato') or '').upper()
+                if 'FUJIMORI' in n or 'KEIKO' in n:   keiko   = c
+                if 'SANCHEZ'  in n or 'SÁNCHEZ' in n: sanchez = c
+
+              if not keiko or not sanchez:
+                if len(cands) >= 2:
+                  sanchez, keiko = cands[0], cands[1]
+
+              if keiko and sanchez:
+                sP = float(sanchez.get('porcentajeVotosValidos') or 0)
+                sV = int(sanchez.get('totalVotosValidos') or 0)
+                kP = float(keiko.get('porcentajeVotosValidos') or 0)
+                kV = int(keiko.get('totalVotosValidos') or 0)
+
+                resultado = {
+                  'sanchez': {'nombre': sanchez.get('nombreCandidato','Roberto Sánchez').title(),
+                              'partido':'Juntos por el Perú','pct':sP,'votos':sV},
+                  'keiko':   {'nombre': keiko.get('nombreCandidato','Keiko Fujimori').title(),
+                              'partido':'Fuerza Popular','pct':kP,'votos':kV},
+                  'actasPct':   float(tots.get('actasContabilizadas') or tots.get('porcentajeActas') or 0),
+                  'totalActas': int(tots.get('totalActas') or tots.get('cantidadActas') or 0),
+                  'diff':       abs(sV - kV),
+                  'lider':      'sanchez' if sV >= kV else 'keiko',
+                  'fuente':     'ONPE API oficial',
+                  'actualizadoEn': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                }
+
+                with open('resultados.json','w',encoding='utf-8') as f:
+                  json.dump(resultado, f, ensure_ascii=False, indent=2)
+
+                print('\n✅ resultados.json actualizado:')
+                print(json.dumps(resultado, ensure_ascii=False, indent=2))
               else:
-                raise ValueError(f'Candidatos no identificados: {json.dumps(cands)[:300]}')
-
-            def pct(c): return float(c.get('porcentajeVotosValidos') or 0)
-            def vot(c): return int(c.get('totalVotosValidos') or 0)
-
-            sP=pct(sanchez); sV=vot(sanchez)
-            kP=pct(keiko);   kV=vot(keiko)
-
-            resultado = {
-              'sanchez': {'nombre': sanchez.get('nombreCandidato','Roberto Sánchez').title(),
-                          'partido':'Juntos por el Perú','pct':sP,'votos':sV},
-              'keiko':   {'nombre': keiko.get('nombreCandidato','Keiko Fujimori').title(),
-                          'partido':'Fuerza Popular','pct':kP,'votos':kV},
-              'actasPct':   float(tots.get('actasContabilizadas') or tots.get('porcentajeActas') or 0),
-              'totalActas': int(tots.get('totalActas') or tots.get('cantidadActas') or 0),
-              'diff':       abs(sV - kV),
-              'lider':      'sanchez' if sV >= kV else 'keiko',
-              'fuente':     'ONPE API oficial',
-              'actualizadoEn': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-            }
-
-            with open('resultados.json','w',encoding='utf-8') as f:
-              json.dump(resultado, f, ensure_ascii=False, indent=2)
-
-            print('✅ OK')
-            print(json.dumps(resultado, ensure_ascii=False, indent=2))
+                print('\n⚠ Candidatos no identificados en la respuesta')
+            else:
+              print('\n⚠ Endpoint de candidatos no retornó JSON válido')
 
           except Exception as e:
-            print(f'ERROR: {e}', file=sys.stderr)
-            import os
-            if not os.path.exists('resultados.json'):
-              with open('resultados.json','w') as f:
-                json.dump({'error':str(e),'actualizadoEn':datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')},f)
+            import traceback
+            print(f'\n❌ ERROR: {e}')
+            traceback.print_exc()
             sys.exit(0)
           PYEOF
 
