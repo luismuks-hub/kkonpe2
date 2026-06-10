@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: onpe-monitor
+    env: static
+    buildCommand: ""
+    staticPublishPath: .
+    pullRequestPreviewsEnabled: false
+    # Solo redesplegar cuando cambie index.html, no cuando cambie resultados.json
+    autoDeploy: false
