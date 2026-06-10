@@ -211,6 +211,13 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add resultados.json historial.csv onpe_screenshot.png onpe_error.png onpe_debug.html 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "data: RPA ONPE $(date -u '+%H:%M UTC')"
-          git push
+          # Forzar que historial.csv siempre exista en el repo
+          git add -f resultados.json historial.csv onpe_screenshot.png 2>/dev/null || true
+          git add onpe_error.png onpe_debug.html 2>/dev/null || true
+          # Commit si hay cualquier cambio staged
+          if ! git diff --cached --quiet; then
+            git commit -m "data: RPA ONPE $(date -u '+%H:%M UTC')"
+            git push
+          else
+            echo "Sin cambios en datos — ONPE no actualizó desde el último run"
+          fi
