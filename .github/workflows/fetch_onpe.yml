@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Instalar curl_cffi
+      - name: Instalar dependencias
         run: pip install curl_cffi
 
       - name: Consultar API ONPE
@@ -27,51 +27,63 @@ jobs:
           import json, sys
           from datetime import datetime, timezone
 
-          BASE = 'https://resultadosegundavuelta.onpe.gob.pe/presentacion-backend'
-          OPTS = dict(
-            headers={
-              'Accept': 'application/json, text/plain, */*',
-              'Accept-Language': 'es-PE,es;q=0.9',
-              'Referer': 'https://resultadosegundavuelta.onpe.gob.pe/main/resumen',
-              'Origin':  'https://resultadosegundavuelta.onpe.gob.pe',
-            },
-            impersonate='chrome124',
-            timeout=15
-          )
+          FRONTEND = 'https://resultadosegundavuelta.onpe.gob.pe'
+          BASE     = f'{FRONTEND}/presentacion-backend'
 
-          def get(path):
-            url = f'{BASE}{path}'
-            print(f'>>> GET {url}')
-            r = requests.get(url, **OPTS)
-            print(f'    Status: {r.status_code} | Inicio: {r.text[:80]}')
+          HEADERS = {
+            'Accept-Language': 'es-PE,es;q=0.9,en;q=0.8',
+            'Referer':  f'{FRONTEND}/main/resumen',
+            'Origin':    FRONTEND,
+          }
+
+          # Usar una sesión para que las cookies se mantengan entre requests
+          session = requests.Session()
+
+          def get(url, accept='application/json, text/plain, */*'):
+            h = {**HEADERS, 'Accept': accept}
+            r = session.get(url, headers=h, impersonate='chrome124', timeout=20)
+            print(f'  {r.status_code} | {url[-60:]} | inicio: {r.text[:60].strip()}')
             return r
 
           try:
-            # 1. Obtener idEleccion del proceso activo
-            r = get('/proceso/proceso-electoral-activo')
-            proc = r.json()
-            # El log mostró: {"data": {"id": 3, ...}}
-            id_e = proc.get('data', {}).get('id') or proc.get('data', {}).get('idEleccion') or 3
-            print(f'✅ idEleccion: {id_e}')
+            # ── PASO 1: visitar el frontend para obtener cookies de sesión ──
+            print('\n[1] Iniciando sesión en el frontend...')
+            get(FRONTEND + '/', accept='text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8')
+            get(FRONTEND + '/main/resumen', accept='text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8')
+            print(f'    Cookies obtenidas: {dict(session.cookies)}')
 
-            # 2. Candidatos con el id correcto
-            rc = get(f'/candidatos/candidatos-segunda-vuelta?idEleccion={id_e}&tipoFiltro=eleccion')
-            rt = get(f'/totales/totales-segunda-vuelta?idEleccion={id_e}&tipoFiltro=eleccion')
+            # ── PASO 2: obtener idEleccion ──
+            print('\n[2] Obteniendo idEleccion...')
+            r = get(f'{BASE}/proceso/proceso-electoral-activo')
+            proc = r.json()
+            id_e = proc.get('data', {}).get('id') or proc.get('data', {}).get('idEleccion') or 3
+            print(f'    idEleccion: {id_e}')
+
+            # ── PASO 3: candidatos y totales ──
+            print('\n[3] Consultando candidatos y totales...')
+            rc = get(f'{BASE}/candidatos/candidatos-segunda-vuelta?idEleccion={id_e}&tipoFiltro=eleccion')
+            rt = get(f'{BASE}/totales/totales-segunda-vuelta?idEleccion={id_e}&tipoFiltro=eleccion')
 
             if rc.text.strip().startswith('<'):
-              raise ValueError(f'Candidatos devolvió HTML con idEleccion={id_e}. La API puede requerir sesión o cambió.')
+              # Último intento: usar idEleccionPrincipal=10 que también apareció en el log
+              print('\n[3b] Intentando con idEleccionPrincipal=10...')
+              rc = get(f'{BASE}/candidatos/candidatos-segunda-vuelta?idEleccion=10&tipoFiltro=eleccion')
+              rt = get(f'{BASE}/totales/totales-segunda-vuelta?idEleccion=10&tipoFiltro=eleccion')
+
+            if rc.text.strip().startswith('<'):
+              raise ValueError('La API sigue devolviendo HTML. ONPE puede haber cerrado el acceso externo.')
 
             cands_raw = rc.json()
-            tots_raw  = rt.json() if not rt.text.strip().startswith('<') else {}
+            tots_raw  = rt.json() if rt.text.strip() and not rt.text.strip().startswith('<') else {}
 
             cands = cands_raw if isinstance(cands_raw, list) else (cands_raw.get('data') or [])
             tots  = tots_raw  if isinstance(tots_raw,  dict) else (tots_raw.get('data')  or {})
 
-            print(f'Candidatos recibidos: {len(cands)}')
+            print(f'\n    Candidatos: {len(cands)}')
             for c in cands:
-              print(f'  - {c.get("nombreCandidato")} | pct={c.get("porcentajeVotosValidos")} | votos={c.get("totalVotosValidos")}')
+              print(f'      {c.get("nombreCandidato")} | {c.get("porcentajeVotosValidos")}% | {c.get("totalVotosValidos")} votos')
 
-            # 3. Identificar por nombre
+            # ── PASO 4: identificar y guardar ──
             keiko = sanchez = None
             for c in cands:
               n = (c.get('nombreCandidato') or '').upper()
@@ -81,9 +93,6 @@ jobs:
             if not keiko or not sanchez:
               if len(cands) >= 2:
                 sanchez, keiko = cands[0], cands[1]
-                print('⚠ Identificados por posición (no por nombre)')
-              else:
-                raise ValueError('No se encontraron 2 candidatos')
 
             sP = float(sanchez.get('porcentajeVotosValidos') or 0)
             sV = int(sanchez.get('totalVotosValidos') or 0)
@@ -91,16 +100,10 @@ jobs:
             kV = int(keiko.get('totalVotosValidos') or 0)
 
             resultado = {
-              'sanchez': {
-                'nombre':  sanchez.get('nombreCandidato', 'Roberto Sánchez').title(),
-                'partido': 'Juntos por el Perú',
-                'pct': sP, 'votos': sV
-              },
-              'keiko': {
-                'nombre':  keiko.get('nombreCandidato', 'Keiko Fujimori').title(),
-                'partido': 'Fuerza Popular',
-                'pct': kP, 'votos': kV
-              },
+              'sanchez': {'nombre': sanchez.get('nombreCandidato','Roberto Sánchez').title(),
+                          'partido':'Juntos por el Perú','pct':sP,'votos':sV},
+              'keiko':   {'nombre': keiko.get('nombreCandidato','Keiko Fujimori').title(),
+                          'partido':'Fuerza Popular','pct':kP,'votos':kV},
               'actasPct':   float(tots.get('actasContabilizadas') or tots.get('porcentajeActas') or 0),
               'totalActas': int(tots.get('totalActas') or tots.get('cantidadActas') or 0),
               'diff':       abs(sV - kV),
@@ -109,10 +112,10 @@ jobs:
               'actualizadoEn': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             }
 
-            with open('resultados.json', 'w', encoding='utf-8') as f:
+            with open('resultados.json','w',encoding='utf-8') as f:
               json.dump(resultado, f, ensure_ascii=False, indent=2)
 
-            print('\n✅ resultados.json actualizado:')
+            print('\n✅ resultados.json guardado:')
             print(json.dumps(resultado, ensure_ascii=False, indent=2))
 
           except Exception as e:
@@ -121,8 +124,8 @@ jobs:
             traceback.print_exc()
             import os
             if not os.path.exists('resultados.json'):
-              with open('resultados.json', 'w') as f:
-                json.dump({'error': str(e), 'actualizadoEn': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}, f)
+              with open('resultados.json','w') as f:
+                json.dump({'error':str(e),'actualizadoEn':datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')},f)
             sys.exit(0)
           PYEOF
 
