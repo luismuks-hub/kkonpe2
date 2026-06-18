@@ -2,20 +2,20 @@
   "sanchez": {
     "nombre": "Roberto Helbert Sanchez Palomino",
     "partido": "Juntos por el Perú",
-    "pct": 50.104,
-    "votos": 9109292
+    "pct": 50.107,
+    "votos": 9118516
   },
   "keiko": {
     "nombre": "Keiko Sofia Fujimori Higuchi",
     "partido": "Fuerza Popular",
-    "pct": 49.896,
-    "votos": 9147437
+    "pct": 49.893,
+    "votos": 9157631
   },
-  "actasPct": 99.258,
+  "actasPct": 99.383,
   "totalActas": 92766,
-  "diff": 38145,
+  "diff": 39115,
   "lider": "keiko",
-  "onpeTs": "17/06/2026 06:05:18 p. m.",
+  "onpeTs": "18/06/2026 05:50:26 a. m.",
   "fuente": "ONPE web (Playwright RPA)",
-  "actualizadoEn": "2026-06-17T23:12:00Z"
+  "actualizadoEn": "2026-06-18T10:57:55Z"
 }
